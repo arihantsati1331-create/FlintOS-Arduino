@@ -20,6 +20,8 @@ By aggressively implementing the `F()` macro for string literals and utilizing t
 * **Microcontroller:** Arduino Uno (ATmega328P)
 * **Display:** 2.8"/3.5" TFT LCD Shield (IL9341 Driver or compatible MCUFRIEND pinout)
 * **Storage:** 32GB SD Card (Optional / Expandable for storage updates)(**IMPORTANT**:-*THIS IS NOT INCLUDED IN THIS CODE*)
+* **SOUND:**  AS OF LOW RAM WE HAVE KEPT IT SIMPLE AND USE A 2 PIN BUZZER , ITS SMALL AND LIGHT , CONNECT THE (+) PIN TO GPIO 12 AND GND TO GROUND , FOR A SAFER SIDE I PREFER TO POWER IT FROM AN ADAPTER OF UR AND SOMETHING LIKE :- 
+UNO R3'S DATA PORT CONNECT AND CONNECT IT TO ADAPTER 
 
 ## 📦 Core Libraries Used
 * `Adafruit_GFX.h`
@@ -32,4 +34,7 @@ By aggressively implementing the `F()` macro for string literals and utilizing t
 2. Connect your 2.8"/3.5" TFT Shield to your Arduino Uno.
 3. Open the file in the Arduino IDE.
 4. Ensure your display driver ID matches (FlintOS includes auto-fallback filtering for `0x9341`).
-5. Compile and upload! (Default Master PIN: **1021**)
+5. Compile and upload! (Default Master PIN: **1021**
+## IF ANY QUERRY U MAY AS ME AT 
+DISCORD(SORRY BUT IF I DONT ACCPET UR REQUEST PLZ TRY METHOD 2  ) :- https://discord.gg/YSMJAhyWu
+THANK YOU !
