@@ -1,0 +1,668 @@
+#include <Adafruit_GFX.h>
+#include <MCUFRIEND_kbv.h>
+#include <TouchScreen.h>
+#include <EEPROM.h> 
+
+#define YP A1  
+#define XM A2  
+#define YM 7   
+#define XP 6   
+
+#define MINPRESSURE 10
+#define MAXPRESSURE 1000
+
+#define TS_LEFT 140
+#define TS_RT    900
+#define TS_TOP    850
+#define TS_BOT    120
+
+#define BUZZER_PIN 12
+
+MCUFRIEND_kbv tft;
+TouchScreen ts = TouchScreen(XP, YP, XM, YM, 300);
+
+enum AppState { BOOTING, LOCK_SCREEN, HOME_SCREEN, NOTES, FLASH_APP, MORE_APPS, GAME, SNAKE, FLAP, ALARM };
+AppState currentState = BOOTING;
+
+int startX = 0, startY = 0;
+unsigned long touchStartTime = 0;
+bool isPressing = false;
+
+bool torchActive = false;
+int gameScore = 0;
+
+// High Score Global Holding Cells
+int hiRace = 0, hiSnake = 0, hiFlap = 0;
+
+// Boot Animation Tracking
+unsigned long bootStartTime = 0;
+int lastBootPct = -1;
+
+// Race Game Variables
+int playerLane = 1, enemyLane = 0, enemyY = -30, gameSpeed = 12;
+unsigned long lastGameTick = 0;
+
+// Snake Game Variables
+int snakeX[16], snakeY[16]; 
+int snakeLen = 3, snakeDir = 1, appleX, appleY;
+unsigned long lastSnakeTick = 0;
+bool isSnakeOver = false, isGameOver = false;
+
+// Flappy Bird Game Variables
+int birdY = 80, birdVelocity = 0;
+int pipeX = 320, pipeGapY = 60, pipeGapHeight = 55;
+unsigned long lastFlapTick = 0;
+bool isFlapOver = false;
+
+// Alarm App Variables
+unsigned long alarmTargetTime = 0;
+bool alarmActive = false;
+bool alarmBeeping = false;
+int selectedAlarmHours = 5; 
+unsigned long lastBuzzerTick = 0;
+bool buzzerState = false;
+
+uint16_t currentPenColor = 0x0000; 
+unsigned long lastBatteryUpdate = 0;
+int batteryFrame = 0;
+
+struct SystemTheme {
+    uint16_t bg;       
+    uint16_t text;     
+    uint16_t panel;    
+    uint16_t accent;   
+};
+
+SystemTheme theme = {0x0000, 0xFFFF, 0x03E0, 0x1082}; // Dark Theme default
+bool isLightMode = false;
+
+const char MASTER_PIN[4] = {'1', '0', '2', '1'}; 
+char enteredPin[4] = {' ', ' ', ' ', ' '};
+int pinCount = 0;
+bool showKeypad = false;
+unsigned long pinErrorTime = 0;
+bool isPinError = false;
+
+const uint16_t colorGrid[7] PROGMEM = {0xF800, 0x07E0, 0x001F, 0xFFE0, 0xF81F, 0x0000, 0xFFFF};
+
+void setup() {
+    pinMode(BUZZER_PIN, OUTPUT);
+
+    // ---- DJI / MAVIC STYLE STARTUP CHIME ----
+    tone(BUZZER_PIN, 750); delay(500); noTone(BUZZER_PIN); delay(150);
+    tone(BUZZER_PIN, 950); delay(120); noTone(BUZZER_PIN); delay(79);
+    tone(BUZZER_PIN, 1100); delay(120); noTone(BUZZER_PIN); delay(70);
+    tone(BUZZER_PIN, 1400); delay(450); noTone(BUZZER_PIN); delay(150);
+    tone(BUZZER_PIN, 1700); delay(90);  tone(BUZZER_PIN, 2000); delay(120);
+    tone(BUZZER_PIN, 1700); delay(90);  tone(BUZZER_PIN, 2000); delay(120);
+    noTone(BUZZER_PIN);
+
+    uint16_t displayID = tft.readID();
+    if(displayID == 0x0101) displayID = 0x9341; 
+    tft.begin(displayID);
+    tft.setRotation(1); 
+    
+    EEPROM.get(0, hiRace);
+    EEPROM.get(4, hiSnake);
+    EEPROM.get(8, hiFlap);
+    
+    if (hiRace < 0 || hiRace > 9999) hiRace = 0;
+    if (hiSnake < 0 || hiSnake > 9999) hiSnake = 0;
+    if (hiFlap < 0 || hiFlap > 9999) hiFlap = 0;
+
+    bootStartTime = millis();
+    renderCurrentState();
+}
+
+void loop() {
+    unsigned long now = millis();
+    
+    // Background execution of Alarm monitoring (Non-Blocking)
+    updateAlarmBackgroundSystem();
+
+    if (currentState == BOOTING) {
+        int progressPct = ((now - bootStartTime) * 100) / 6000;
+        if (progressPct > 100) progressPct = 100;
+        if (progressPct != lastBootPct) {
+            lastBootPct = progressPct;
+            updateBootAnimation(progressPct);
+        }
+        if (now - bootStartTime >= 6000) {
+            currentState = LOCK_SCREEN;
+            renderCurrentState();
+        }
+        return; 
+    }
+
+    if (currentState == LOCK_SCREEN) {
+        if (now - lastBatteryUpdate > 1000) {
+            lastBatteryUpdate = now;
+            batteryFrame = (batteryFrame + 1) % 4;
+            drawBatteryIcon(270, 10, true);
+        }
+        if (isPinError && (now - pinErrorTime > 1000)) {
+            isPinError = false;
+            renderCurrentState();
+        }
+    }
+    
+    // Dynamic countdown display updater
+    if (currentState == ALARM && alarmActive && !alarmBeeping) {
+        static unsigned long lastSecDraw = 0;
+        if (now - lastSecDraw > 1000) { lastSecDraw = now; drawAlarmApp(); }
+    }
+    
+    if (currentState == GAME && !isGameOver && now - lastGameTick > 60) { lastGameTick = now; updateGamePhysics(); }
+    if (currentState == SNAKE && !isSnakeOver && now - lastSnakeTick > 160) { lastSnakeTick = now; updateSnakePhysics(); }
+    if (currentState == FLAP && !isFlapOver && now - lastFlapTick > 40) { lastFlapTick = now; updateFlapPhysics(); }
+
+    TSPoint p = ts.getPoint();
+    pinMode(XM, OUTPUT); pinMode(YP, OUTPUT);
+    digitalWrite(XM, HIGH); digitalWrite(YP, HIGH);
+
+    if (p.z > MINPRESSURE && p.z < MAXPRESSURE) {
+        int touchX = map(p.x, TS_LEFT, TS_RT, 0, 320);
+        int touchY = map(p.y, TS_TOP, TS_BOT, 0, 240);
+        
+        if (currentState == NOTES && touchY < 210) { handleNotesCanvas(touchX, touchY); return; }
+        if (!isPressing) { isPressing = true; touchStartTime = now; startX = touchX; startY = touchY; }
+    } else if (isPressing) {
+        isPressing = false;
+        TSPoint rP = ts.getPoint();
+        pinMode(XM, OUTPUT); pinMode(YP, OUTPUT);
+        if ((millis() - touchStartTime) > 60 && (map(rP.x, TS_LEFT, TS_RT, 0, 320) - startX) > 70) {
+            handleGlobalSwipeRight();
+        } else {
+            handleTapEvent(startX, startY);
+        }
+    }
+}
+
+void handleGlobalSwipeRight() {
+    if (currentState == LOCK_SCREEN || currentState == BOOTING) return;
+    torchActive = false;
+    if (alarmBeeping) { alarmBeeping = false; alarmActive = false; noTone(BUZZER_PIN); }
+    currentState = (currentState == GAME || currentState == SNAKE || currentState == FLAP) ? MORE_APPS : HOME_SCREEN;
+    renderCurrentState();
+}
+
+void drawNavBar() {
+    if (currentState == LOCK_SCREEN || currentState == FLASH_APP || currentState == BOOTING) return;
+    tft.fillRect(0, 210, 320, 30, 0x1082);
+    tft.fillTriangle(65, 225, 75, 217, 75, 233, 0xFFFF);
+    tft.drawRoundRect(150, 217, 16, 16, 3, 0xFFFF);
+    tft.drawRoundRect(240, 217, 14, 14, 1, 0xFFFF);
+}
+
+void handleTapEvent(int x, int y) {
+    if (currentState != LOCK_SCREEN && currentState != FLASH_APP && currentState != BOOTING && y >= 210 && x >= 40 && x <= 190) {
+        currentState = HOME_SCREEN; renderCurrentState(); return;
+    }
+
+    switch (currentState) {
+        case LOCK_SCREEN:
+            if (!showKeypad) {
+                showKeypad = true;
+                renderCurrentState();
+            } else {
+                for (int r = 0; r < 4; r++) {
+                    for (int c = 0; c < 3; c++) {
+                        int cx = 85 + (c * 75);
+                        int cy = 75 + (r * 42);
+                        if (x >= (cx - 16) && x <= (cx + 16) && y >= (cy - 16) && y <= (cy + 16)) {
+                            int num = r * 3 + c + 1;
+                            char pressedKey = ' ';
+                            
+                            if (num <= 9) pressedKey = '0' + num;
+                            else if (num == 11) pressedKey = '0';
+                            else if (num == 10) { pinCount = 0; renderCurrentState(); return; } 
+                            else if (num == 12) { showKeypad = false; pinCount = 0; renderCurrentState(); return; } 
+                            
+                            if (pressedKey != ' ' && pinCount < 4) {
+                                enteredPin[pinCount++] = pressedKey;
+                                renderCurrentState();
+                                
+                                if (pinCount == 4) {
+                                    delay(150); 
+                                    if (memcmp(enteredPin, MASTER_PIN, 4) == 0) {
+                                        showKeypad = false;
+                                        currentState = HOME_SCREEN;
+                                    } else {
+                                        isPinError = true;
+                                        pinErrorTime = millis();
+                                    }
+                                    pinCount = 0;
+                                    renderCurrentState();
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+            break;
+
+        case HOME_SCREEN:
+            if (y >= 40 && y <= 100) {
+                if (x >= 20 && x <= 150) { currentState = NOTES; }
+                else if (x >= 170 && x <= 300) { currentState = FLASH_APP; }
+                renderCurrentState();
+            }
+            else if (y >= 120 && y <= 180) { 
+                if (x >= 20 && x <= 150) { currentState = MORE_APPS; }
+                else if (x >= 170 && x <= 300) { currentState = ALARM; }
+                renderCurrentState(); 
+            }
+            break;
+
+        case MORE_APPS:
+            if (x >= 200 && x <= 300 && y >= 10 && y <= 35) {
+                isLightMode = !isLightMode;
+                theme = isLightMode ? (SystemTheme){0xFFFF, 0x0000, 0xC618, 0x2104} : (SystemTheme){0x0000, 0xFFFF, 0x03E0, 0x1082};
+                renderCurrentState();
+                return;
+            }
+            if (y >= 60 && y <= 130) {
+                if (x >= 15 && x <= 105) initCarGame();
+                else if (x >= 115 && x <= 205) initSnakeGame();
+                else if (x >= 215 && x <= 305) initFlapGame();
+                renderCurrentState();
+            }
+            break;
+
+        case FLASH_APP: 
+            if (x >= 60 && x <= 260 && y >= 70 && y <= 170) { torchActive = !torchActive; drawFlashApp(); } 
+            else if (y >= 190) { torchActive = false; currentState = HOME_SCREEN; renderCurrentState(); } 
+            break;
+        case GAME: if (isGameOver) initCarGame(); else playerLane = (x < 160) ? max(0, playerLane-1) : min(2, playerLane+1); break;
+        case SNAKE:
+            if (isSnakeOver) initSnakeGame();
+            else if (y > 160 && y < 210) {
+                if (x < 100 && snakeDir != 1) snakeDir = 3;       
+                else if (x > 220 && snakeDir != 3) snakeDir = 1;  
+                else if (x >= 100 && x <= 220) {
+                    snakeDir = (y < 185) ? (snakeDir != 2 ? 0 : snakeDir) : (snakeDir != 0 ? 2 : snakeDir);
+                }
+            }
+            break;
+        case FLAP: if (isFlapOver) initFlapGame(); else birdVelocity = -5; break;
+        case ALARM: handleAlarmTaps(x, y); break;
+    }
+}
+
+void renderCurrentState() {
+    if (currentState != FLASH_APP) tft.fillScreen(theme.bg);
+    switch (currentState) {
+        case BOOTING: drawBootFramework(); break;
+        case LOCK_SCREEN: drawLockScreen(); break;
+        case HOME_SCREEN: drawHomeScreen(); break;
+        case NOTES: drawNotesApp(); break;
+        case FLASH_APP: drawFlashApp(); break;
+        case MORE_APPS: drawMoreAppsScreen(); break;
+        case GAME: drawCarGameFramework(); break;
+        case SNAKE: drawSnakeGameFramework(); break;
+        case FLAP: drawFlapGameFramework(); break;
+        case ALARM: drawAlarmApp(); break;
+    }
+    drawNavBar();
+}
+
+void drawBootFramework() {
+    tft.fillScreen(0x0000);
+    tft.setTextColor(0x07E0); 
+    tft.setTextSize(2);
+    tft.setCursor(45, 50);
+    tft.print(F("FlintOS  ||v2.6||"));
+    tft.drawFastHLine(45, 72, 230, 0x31A6);
+    
+    tft.setTextSize(1);
+    tft.setTextColor(0xFFFF);
+    tft.setCursor(45, 85); tft.print(F("HARDWARE ID: 0x")); tft.print(tft.readID(), HEX);
+    tft.setCursor(45, 100); tft.print(F("DRVR: MCUFRIEND_KBV RES: 320x240"));
+    tft.drawRect(45, 160, 230, 14, 0xFFFF);
+}
+
+void updateBootAnimation(int pct) {
+    tft.fillRect(47, 162, (pct * 226) / 100, 10, 0x07E0);
+    tft.fillRect(45, 130, 230, 12, 0x0000); 
+    tft.setCursor(45, 130);
+    tft.setTextColor(0x7BEF);
+    
+    if (pct < 20) tft.print(F("Mounting file tracks..."));
+    else if (pct < 45) tft.print(F("Allocating graphic frames..."));
+    else if (pct < 70) tft.print(F("Binding Analog Touch Matrix..."));
+    else if (pct < 90) tft.print(F("Starting core scheduling threads..."));
+    else tft.print(F("Ready."));
+    
+    tft.setTextColor(0xFFFF);
+    tft.fillRect(245, 180, 40, 12, 0x0000);
+    tft.setCursor(245, 180);
+    tft.print(pct); tft.print(F("%"));
+}
+
+void drawBatteryIcon(int x, int y, bool chg) {
+    tft.drawRect(x, y, 35, 18, theme.text); tft.fillRect(x + 35, y + 4, 3, 10, theme.text);
+    tft.fillRect(x + 2, y + 2, 31, 14, theme.bg);
+    for (int i = 0; i <= (chg ? batteryFrame : 3); i++) tft.fillRect(x + 3 + (i * 7), y + 4, 5, 10, 0x07E0);
+}
+
+void drawLockScreen() { 
+    drawBatteryIcon(270, 10, true); 
+    tft.setTextColor(theme.text); 
+    
+    if (!showKeypad) {
+        tft.setTextSize(3); tft.setCursor(55, 65); tft.print(F("Welcome,A.O.D")); 
+        tft.setTextSize(2); tft.setCursor(85, 160); tft.print(F("tap!")); 
+    } else {
+        tft.setTextSize(2); tft.setCursor(40, 20);
+        if (isPinError) { tft.setTextColor(0xF800); tft.print(F(" WRONG PIN! ")); } 
+        else { tft.print(F("Enter Passcode")); }
+        
+        tft.setCursor(240, 20); tft.setTextColor(theme.accent);
+        for(int i = 0; i < 4; i++) { tft.print(i < pinCount ? F("* ") : F("_ ")); }
+        
+        for (int r = 0; r < 4; r++) {
+            for (int c = 0; c < 3; c++) {
+                int cx = 85 + (c * 75), cy = 75 + (r * 42);
+                tft.drawCircle(cx, cy, 16, theme.text);
+                tft.setCursor(cx - 5, cy - 7); tft.setTextColor(theme.text);
+                int num = r * 3 + c + 1;
+                if (num <= 9) tft.print(num);
+                else if (num == 10) tft.print(F("C"));  
+                else if (num == 11) tft.print(0);
+                else if (num == 12) tft.print(F("X"));  
+            }
+        }
+    }
+}
+
+void drawHomeScreen() { 
+    drawBatteryIcon(270, 10, false); 
+    tft.fillRoundRect(20, 40, 130, 60, 8, theme.panel);  
+    tft.fillRoundRect(170, 40, 130, 60, 8, 0xFEA0); 
+    tft.fillRoundRect(20, 120, 130, 60, 8, theme.accent); 
+    tft.fillRoundRect(170, 120, 130, 60, 8, 0x241F); 
+    
+    tft.setTextColor(theme.text); tft.setTextSize(2);
+    tft.setCursor(55, 62);   tft.print(F("NOTES")); 
+    tft.setCursor(205, 62);  tft.print(F("FLASH")); 
+    tft.setCursor(55, 142);  tft.print(F("GAMES"));
+    tft.setTextColor(0xFFFF);
+    tft.setCursor(205, 142); tft.print(F("ALARM"));
+}
+
+void drawMoreAppsScreen() { 
+    tft.setCursor(20, 15); tft.setTextColor(theme.text); tft.setTextSize(2); tft.print(F("Arcade Dash")); 
+    tft.drawRoundRect(200, 12, 100, 22, 11, theme.text);
+    tft.setTextSize(1); tft.setCursor(212, 19); tft.print(isLightMode ? F("MODE: LIGHT") : F("MODE: DARK"));
+
+    tft.fillRoundRect(15, 60, 90, 55, 6, 0xF81F); 
+    tft.fillRoundRect(115, 60, 90, 55, 6, 0x07E0); 
+    tft.fillRoundRect(215, 60, 90, 55, 6, 0xFBE0); 
+    
+    tft.setTextColor(theme.text);
+    const char* labels[] = {"RACE", "SNAKE", "FLAP"};
+    int scores[] = {hiRace, hiSnake, hiFlap};
+    for(int i=0; i<3; i++) {
+        tft.setCursor(48 + (i*100), 125); tft.print(labels[i]);
+        tft.setCursor(42 + (i*100), 140); tft.print(F("HI: ")); tft.print(scores[i]);
+    }
+}
+
+void drawNotesApp() { 
+    tft.fillScreen(0xFFFF); tft.fillRect(0, 0, 320, 35, 0x2104); 
+    tft.fillRect(250, 4, 65, 26, 0xF800); tft.setCursor(264, 13); tft.setTextColor(0xFFFF); tft.print(F("CLR")); 
+    for(int i = 0; i < 7; i++) { 
+        uint16_t c = pgm_read_word(&colorGrid[i]);
+        tft.fillRect(2, 38 + (i * 24), 32, 22, c); 
+        tft.drawRect(2, 38 + (i * 24), 32, 22, 0x0000); 
+    }
+    tft.setTextColor(0x0000); tft.setTextSize(1); tft.setCursor(14, 190); tft.print(F("E")); 
+}
+
+void handleNotesCanvas(int tx, int ty) {
+    if (tx >= 250 && tx <= 315 && ty >= 4 && ty <= 30) { tft.fillRect(38, 36, 282, 172, 0xFFFF); return; }
+    if (tx <= 36 && ty >= 35) { 
+        if (tx >= 2 && tx <= 34) {
+            for(int i = 0; i < 7; i++) { 
+                if(ty >= 38 + (i * 24) && ty <= 60 + (i * 24)) { 
+                    currentPenColor = pgm_read_word(&colorGrid[i]); 
+                } 
+            }
+        } return; 
+    }
+    if (ty > 36 && tx > 38 && tx < 318 && ty < 208) { 
+        if (currentPenColor == 0xFFFF) tft.fillRect(tx - 5, ty - 5, 10, 10, 0xFFFF); 
+        else tft.fillRect(tx - 1, ty - 1, 4, 4, currentPenColor); 
+    }
+}
+
+void drawFlashApp() { tft.fillScreen(torchActive ? 0xFFFF : 0x2104); tft.fillRoundRect(60, 70, 200, 60, 10, torchActive ? 0x07E0 : 0xF800); tft.setTextSize(2); tft.setTextColor(0xFFFF); tft.setCursor(105, 92); tft.print(torchActive ? F("SYSTEM ON") : F("SYSTEM OFF")); }
+
+// ==========================================
+// NEW APP: ALARM APP 
+// ==========================================
+void drawAlarmApp() {
+    tft.fillScreen(theme.bg);
+    tft.setTextColor(theme.text);
+    tft.setTextSize(2);
+    tft.setCursor(20, 20);
+    tft.print(F("Timer Alarm"));
+
+    int hoursOpts[] = {5, 6, 7, 8};
+    for(int i = 0; i < 4; i++) {
+        uint16_t btnColor = (selectedAlarmHours == hoursOpts[i]) ? theme.accent : theme.panel;
+        tft.fillRoundRect(20 + (i * 72), 60, 64, 45, 6, btnColor);
+        tft.setCursor(44 + (i * 72), 75);
+        tft.setTextColor(0xFFFF);
+        tft.print(hoursOpts[i]);
+    }
+
+    tft.fillRoundRect(20, 130, 280, 60, 8, alarmActive ? (alarmBeeping ? 0xF800 : 0x0210) : 0x03E0); 
+    tft.setCursor(35, 152);
+    tft.setTextColor(0xFFFF);
+    tft.setTextSize(2);
+    
+    if (alarmBeeping) {
+        tft.print(F("STOP BUZZER BEEP"));
+    } else if (alarmActive) {
+        tft.print(F("CANCEL"));
+        long remainingSecs = (alarmTargetTime - millis()) / 1000;
+        if(remainingSecs > 0) {
+            int h = remainingSecs / 3600;
+            int m = (remainingSecs % 3600) / 60;
+            int s = remainingSecs % 60;
+            tft.setCursor(150, 152);
+            if(h < 10) tft.print('0'); tft.print(h); tft.print(':');
+            if(m < 10) tft.print('0'); tft.print(m); tft.print(':');
+            if(s < 10) tft.print('0'); tft.print(s);
+        }
+    } else {
+        tft.print(F("START COUNTDOWN"));
+    }
+}
+
+void handleAlarmTaps(int x, int y) {
+    if (y >= 60 && y <= 105 && !alarmActive) {
+        for(int i = 0; i < 4; i++) {
+            if (x >= 20 + (i * 72) && x <= 84 + (i * 72)) {
+                selectedAlarmHours = 5 + i;
+                drawAlarmApp();
+                return;
+            }
+        }
+    }
+    if (x >= 20 && x <= 300 && y >= 130 && y <= 190) {
+        if (alarmBeeping) {
+            alarmBeeping = false;
+            alarmActive = false;
+            noTone(BUZZER_PIN);
+        } else if (alarmActive) {
+            alarmActive = false;
+        } else {
+            alarmTargetTime = millis() + (selectedAlarmHours * 3600000UL);
+            alarmActive = true;
+            alarmBeeping = false;
+        }
+        drawAlarmApp();
+    }
+}
+
+void updateAlarmBackgroundSystem() {
+    if (!alarmActive) return;
+    unsigned long now = millis();
+    
+    if (!alarmBeeping && now >= alarmTargetTime) {
+        alarmBeeping = true;
+        renderCurrentState(); // Forces screen swap to display Stop Option
+    }
+
+    if (alarmBeeping) {
+        if (now - lastBuzzerTick > 300) {
+            lastBuzzerTick = now;
+            buzzerState = !buzzerState;
+            if (buzzerState) tone(BUZZER_PIN, 1300); 
+            else tone(BUZZER_PIN, 1800);
+        }
+    }
+}
+
+// ==========================================
+// GAME 1: RACING GAME
+// ==========================================
+void initCarGame() { currentState = GAME; playerLane = 1; enemyLane = random(0, 3); enemyY = -30; gameScore = 0; gameSpeed = 12; isGameOver = false; }
+void drawCarGameFramework() { tft.fillRect(0, 0, 320, 210, 0x31A6); tft.fillRect(50, 0, 160, 210, 0x4210); drawPlayerVehicle(false); drawEnemyVehicle(false); updateGameScoreUI(); }
+
+void drawPlayerVehicle(bool er) { 
+    int xp = 63 + (playerLane * 53); 
+    uint16_t body = er ? 0x4210 : 0x07E0;  
+    uint16_t wheel = er ? 0x4210 : 0x0000; 
+    uint16_t glass = er ? 0x4210 : 0x07FF; 
+    
+    tft.fillRect(xp,     163, 5,  10, wheel); tft.fillRect(xp + 29, 163, 5,  10, wheel);
+    tft.fillRect(xp,     190, 5,  10, wheel); tft.fillRect(xp + 29, 190, 5,  10, wheel);
+    tft.fillRect(xp + 5,  160, 24, 45, body);
+    tft.fillRect(xp + 10, 172, 14, 12, glass);
+}
+
+void drawEnemyVehicle(bool er) { 
+    int xp = 63 + (enemyLane * 53); 
+    if (enemyY <= -40 || enemyY >= 210) return;
+    
+    uint16_t body = er ? 0x4210 : 0xF800;  
+    uint16_t wheel = er ? 0x4210 : 0x18C3; 
+    uint16_t wing = er ? 0x4210 : 0xFBE0;  
+    
+    tft.fillRect(xp,     enemyY + 5,  5, 9, wheel); tft.fillRect(xp + 29, enemyY + 5,  5, 9, wheel);
+    tft.fillRect(xp,     enemyY + 28, 5, 9, wheel); tft.fillRect(xp + 29, enemyY + 28, 5, 9, wheel);
+    tft.fillRect(xp + 5,  enemyY,     24, 40, body);
+    tft.fillRect(xp + 2,  enemyY + 36, 30, 4, wing); 
+}
+
+void updateGameScoreUI() { 
+    tft.fillRect(215, 20, 100, 150, 0x31A6); tft.setTextColor(0xFFFF); tft.setTextSize(1); 
+    tft.setCursor(225, 40); tft.print(F("SCORE:")); tft.setTextSize(2); tft.setCursor(225, 55); tft.print(gameScore); 
+    tft.setTextSize(1); tft.setCursor(225, 90); tft.print(F("BEST RECORD:")); tft.setTextSize(2); tft.setCursor(225, 105); tft.print(hiRace);
+}
+
+void updateGamePhysics() {
+    drawEnemyVehicle(true); enemyY += gameSpeed; 
+    if (enemyY > 210) { 
+        enemyY = -40; enemyLane = random(0, 3); gameScore += 10; 
+        if(gameScore % 30 == 0 && gameSpeed < 26) gameSpeed += 3; 
+        updateGameScoreUI(); 
+    } 
+    else { drawEnemyVehicle(false); }
+    drawPlayerVehicle(false);
+    
+    if (enemyLane == playerLane && enemyY + 40 >= 160 && enemyY <= 205) { 
+        isGameOver = true; 
+        if (gameScore > hiRace) { hiRace = gameScore; EEPROM.put(0, hiRace); } 
+        tft.fillRect(55, 65, 150, 75, 0x0000); tft.drawRect(55, 65, 150, 75, 0xFFFF); 
+        tft.setTextColor(0xF800); tft.setTextSize(2); tft.setCursor(95, 75);  tft.print(F("CRASH")); 
+        tft.setTextColor(0xFFFF); tft.setTextSize(1); tft.setCursor(70, 100); tft.print(F("Score: ")); tft.print(gameScore);
+        tft.setCursor(70, 115); tft.print(F("Tap track to retry"));
+    }
+}
+
+// ==========================================
+// GAME 2: SNAKE GAME
+// ==========================================
+void initSnakeGame() { currentState = SNAKE; snakeLen = 4; snakeDir = 1; isSnakeOver = false; gameScore = 0; for(int i=0; i<snakeLen; i++) { snakeX[i] = 6 - i; snakeY[i] = 6; } spawnApple(); }
+void spawnApple() { appleX = random(1, 31); appleY = random(2, 14); }
+void drawSnakeGameFramework() { tft.fillRect(0, 0, 320, 160, 0x0000); tft.fillRect(0, 161, 320, 49, 0x1082); tft.setCursor(120, 165); tft.setTextColor(0xFFFF); tft.setTextSize(1); tft.print(F("SCORE: ")); tft.print(gameScore); tft.print(F("   BEST: ")); tft.print(hiSnake); }
+
+void updateSnakePhysics() {
+    tft.fillRect(snakeX[snakeLen-1] * 10, snakeY[snakeLen-1] * 10, 9, 9, 0x0000);
+    for(int i = snakeLen - 1; i > 0; i--) { snakeX[i] = snakeX[i-1]; snakeY[i] = snakeY[i-1]; }
+    
+    if(snakeDir == 0) snakeY[0]--; if(snakeDir == 1) snakeX[0]++; if(snakeDir == 2) snakeY[0]++; if(snakeDir == 3) snakeX[0]--;
+    for(int i = 1; i < snakeLen; i++) { if(snakeX[0] == snakeX[i] && snakeY[0] == snakeY[i]) { isSnakeOver = true; } }
+    if(snakeX[0] < 0 || snakeX[0] > 31 || snakeY[0] < 0 || snakeY[0] > 15) { isSnakeOver = true; }
+    
+    if(isSnakeOver) { 
+        if (gameScore > hiSnake) { hiSnake = gameScore; EEPROM.put(4, hiSnake); } 
+        tft.fillRect(80, 50, 160, 55, 0xF800); tft.setTextColor(0xFFFF); tft.setTextSize(1); tft.setCursor(130, 62); tft.print(F("GAME OVER")); tft.setCursor(98, 82); tft.print(F("Tap pads to restart")); return; 
+    }
+    
+    if(snakeX[0] == appleX && snakeY[0] == appleY) { 
+        if(snakeLen < 16) snakeLen++; gameScore += 5; spawnApple(); 
+        tft.fillRect(120, 165, 180, 10, 0x1082); tft.setCursor(120, 165); tft.setTextColor(0xFFFF); tft.print(F("SCORE: ")); tft.print(gameScore); tft.print(F("   BEST: ")); tft.print(hiSnake); 
+    }
+    
+    int ax = appleX * 10, ay = appleY * 10;
+    tft.fillRect(ax + 2, ay + 2, 6, 6, 0xF800);
+    tft.drawPixel(ax + 4, ay + 1, 0x07E0); 
+    
+    for(int i = 0; i < snakeLen; i++) {
+        int sx = snakeX[i] * 10, sy = snakeY[i] * 10;
+        if (i == 0) {
+            tft.fillRect(sx, sy, 9, 9, 0x07FF); 
+            if (snakeDir == 1 || snakeDir == 3) { tft.drawPixel(sx + 4, sy + 2, 0x0000); tft.drawPixel(sx + 4, sy + 6, 0x0000); }
+            else { tft.drawPixel(sx + 2, sy + 4, 0x0000); tft.drawPixel(sx + 6, sy + 4, 0x0000); }
+        } else {
+            tft.fillRect(sx + 1, sy + 1, 7, 7, 0x07E0); 
+        }
+    }
+}
+
+// ==========================================
+// GAME 3: FLAPPY BIRD
+// ==========================================
+void initFlapGame() { currentState = FLAP; birdY = 80; birdVelocity = 0; pipeX = 320; pipeGapY = random(30, 110); gameScore = 0; isFlapOver = false; }
+void drawFlapGameFramework() { tft.fillRect(0, 0, 320, 210, 0x74FF); tft.setTextColor(0xFFFF); tft.setTextSize(1); tft.setCursor(10, 10); tft.print(F("SCORE: 0   BEST: ")); tft.print(hiFlap); }
+
+void updateFlapPhysics() {
+    tft.fillRect(45, birdY - 4, 24, 20, 0x74FF);
+    tft.fillRect(pipeX + 11, 0, 7, 210, 0x74FF); 
+
+    birdVelocity += 1; birdY += birdVelocity; pipeX -= 7;
+
+    if (pipeX < -18) {
+        pipeX = 320; pipeGapY = random(30, 110); gameScore++;
+        tft.fillRect(10, 10, 200, 12, 0x74FF); tft.setCursor(10, 10); tft.setTextColor(0xFFFF); tft.print(F("SCORE: ")); tft.print(gameScore); tft.print(F("   BEST: ")); tft.print(hiFlap);
+    }
+
+    if (birdY < 0 || birdY > 198) isFlapOver = true;
+    if (pipeX > 26 && pipeX < 64) {
+        if (birdY < pipeGapY || (birdY + 12) > (pipeGapY + pipeGapHeight)) isFlapOver = true;
+    }
+
+    if (isFlapOver) {
+        if (gameScore > hiFlap) { hiFlap = gameScore; EEPROM.put(8, hiFlap); } 
+        tft.fillRect(70, 70, 180, 60, 0xF800); tft.setTextColor(0xFFFF); tft.setTextSize(1);
+        tft.setCursor(130, 85); tft.print(F("GAME OVER")); tft.setCursor(95, 105); tft.print(F("Tap screen to restart"));
+        return;
+    }
+
+    tft.fillRect(pipeX, 0, 18, pipeGapY, 0x03E0); tft.drawRect(pipeX, 0, 18, pipeGapY, 0x0120);
+    tft.fillRect(pipeX, pipeGapY + pipeGapHeight, 18, 210 - (pipeGapY + pipeGapHeight), 0x03E0); tft.drawRect(pipeX, pipeGapY + pipeGapHeight, 18, 210 - (pipeGapY + pipeGapHeight), 0x0120);
+    
+    int bx = 50;
+    tft.fillRoundRect(bx, birdY, 14, 12, 4, 0xFEE0); 
+    tft.fillRect(bx + 12, birdY + 4, 4, 4, 0xFBE0);   
+    tft.drawPixel(bx + 9, birdY + 3, 0x0000);        
+    
+    if (birdVelocity < 0) tft.fillRect(bx + 3, birdY + 2, 5, 4, 0xFFFF); 
+    else                  tft.fillRect(bx + 3, birdY + 6, 5, 4, 0xFFFF); 
+}
